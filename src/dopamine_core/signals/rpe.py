@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dopamine_core.config import LossAversionConfig
+from dopamine_core.config import LossAversionConfig, RPEConfig
 from dopamine_core.types import RPEResult
 
 _EPSILON = 0.01
@@ -29,18 +29,32 @@ class RPECalculator:
     - Low confidence + wrong  = zero signal (expected loss, no update)
     - High confidence + right = zero signal (expected win, no update)
 
-    Note on the `baseline` parameter:
-        `baseline` is the current tonic level. It is NOT used in the RPE
-        computation itself — confidence serves as the prediction. The baseline
-        is used only to compute `surprise` (how large is the error relative
-        to the running average). Pass it so that surprise is meaningful;
-        it does not affect tonic adaptation.
+    ## Baseline Blending (RPEConfig.baseline_blend)
+
+    By default (baseline_blend=0.0), the tonic baseline is NOT used in the RPE
+    computation — confidence serves as the prediction. This preserves the
+    original research behavior.
+
+    When baseline_blend > 0, the learned tonic expectation is blended into the
+    prediction. This closes the feedback loop: the system's learned history
+    informs how new outcomes are processed.
+
+        effective_conf = (1 - blend) * conf + blend * tonic_normalized
+
+    baseline_blend=0.0 → pure confidence-based (original)
+    baseline_blend=0.3 → 30% tonic influence (recommended for persistent agents)
+    baseline_blend=1.0 → pure tonic-based (ignores expressed confidence)
 
     Loss aversion amplifies negative RPE by 1.87x (Kahneman & Tversky).
     """
 
-    def __init__(self, config: LossAversionConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: LossAversionConfig | None = None,
+        rpe_config: RPEConfig | None = None,
+    ) -> None:
         self._config = config or LossAversionConfig()
+        self._rpe_config = rpe_config or RPEConfig()
 
     def compute(
         self,
@@ -54,8 +68,9 @@ class RPECalculator:
             outcome: Normalized outcome in [0, 1] where 1 = full win, 0 = full loss.
             confidence: Agent's extracted confidence in [-1, 1].
                         Mapped to [0, 1] for the formula; serves as the implicit prediction.
-            baseline: Current tonic baseline (used only for surprise normalization,
-                      not for the RPE computation itself).
+            baseline: Current tonic baseline. With baseline_blend=0 (default), used only
+                      for surprise normalization. With baseline_blend>0, blended into the
+                      effective prediction to close the learning feedback loop.
 
         Returns:
             RPEResult with raw and loss-aversion-adjusted error.
@@ -64,9 +79,19 @@ class RPECalculator:
         # This is the implicit prediction: conf_normalized ≈ P(win)
         conf_normalized = (confidence + 1.0) / 2.0
 
-        # RPE = outcome - confidence  (algebraic simplification of the formula)
+        # Optional baseline blending: let learned tonic history inform the prediction.
+        # Blend=0.0 preserves original behavior; blend=0.3 recommended for persistent agents.
+        blend = self._rpe_config.baseline_blend
+        if blend > 0.0 and abs(baseline) > _EPSILON:
+            # Normalize tonic from its natural range [-2, 2] to [0, 1]
+            tonic_normalized = max(0.0, min(1.0, (baseline + 2.0) / 4.0))
+            effective_conf = (1.0 - blend) * conf_normalized + blend * tonic_normalized
+        else:
+            effective_conf = conf_normalized
+
+        # RPE = outcome - effective_confidence (algebraic simplification)
         # Kept in original form for clarity and consistency with the research paper
-        raw_error = outcome * (1.0 - conf_normalized) + (1.0 - outcome) * (-conf_normalized)
+        raw_error = outcome * (1.0 - effective_conf) + (1.0 - outcome) * (-effective_conf)
 
         # Apply loss aversion: negative errors (losses vs expectation) are amplified
         if raw_error < 0:
@@ -75,11 +100,10 @@ class RPECalculator:
             error = raw_error
 
         # Surprise = magnitude of error relative to tonic baseline magnitude
-        # (baseline not used in RPE, used here to scale the surprise signal)
         surprise = abs(raw_error) / max(abs(baseline), _EPSILON)
 
         return RPEResult(
-            prediction=conf_normalized,   # the implicit prediction (confidence)
+            prediction=effective_conf,   # the effective prediction (conf + optional tonic blend)
             actual=outcome,
             error=error,
             raw_error=raw_error,
