@@ -15,9 +15,9 @@ class TonicConfig(BaseModel):
     """Tonic baseline (slow-adapting EMA) parameters."""
 
     initial_baseline: float = 0.0
-    learning_rate: float = Field(default=0.01, ge=0.001, le=0.1)
-    decay_rate: float = Field(default=0.995, ge=0.9, le=1.0)
-    max_level: float = Field(default=1.5, ge=0.5, le=5.0)
+    learning_rate: float = Field(default=0.05, ge=0.001, le=0.5)
+    decay_rate: float = Field(default=0.98, ge=0.9, le=1.0)
+    max_level: float = Field(default=2.0, ge=0.5, le=5.0)
 
 
 class PhasicConfig(BaseModel):
@@ -26,6 +26,7 @@ class PhasicConfig(BaseModel):
     burst_scale: float = Field(default=1.0, ge=0.1, le=5.0)
     dip_scale: float = Field(default=1.87, ge=0.1, le=5.0)
     decay_half_life: int = Field(default=5, ge=1)
+    pnl_scale: float = Field(default=1.0, ge=0.01, le=1000.0)
 
 
 class MomentumConfig(BaseModel):

@@ -118,13 +118,13 @@ def select_template(signal_value: float) -> str:
     Returns:
         A naturalistic context string with no internal terminology.
     """
-    if signal_value > 1.5:
+    if signal_value > 0.6:
         return random.choice(POSITIVE_HIGH)
-    elif signal_value > 0.3:
+    elif signal_value > 0.15:
         return random.choice(POSITIVE_MODERATE)
-    elif signal_value > -0.3:
+    elif signal_value > -0.15:
         return random.choice(NEUTRAL)
-    elif signal_value > -1.5:
+    elif signal_value > -0.6:
         return random.choice(NEGATIVE_MODERATE)
     else:
         return random.choice(NEGATIVE_HIGH)

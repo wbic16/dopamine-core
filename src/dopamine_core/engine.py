@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 
 from dopamine_core.config import DopamineConfig
+from dopamine_core.distributional.channels import DistributionalChannels
+from dopamine_core.distributional.coding import DistributionalCoding
 from dopamine_core.injection.context import ContextInjector
+from dopamine_core.reward.dual_mode import DualModeReward
+from dopamine_core.safety.monitor import SafetyMonitor
 from dopamine_core.signals.extractor import SignalExtractor
+from dopamine_core.signals.momentum import MomentumTracker
 from dopamine_core.signals.rpe import RPECalculator
+from dopamine_core.timescale.tracker import TimescaleTracker
 from dopamine_core.types import (
     CompositeSignal,
     EngineState,
     ExtractedSignals,
     Outcome,
-    RPEResult,
+    TimescaleLevel,
 )
 
 
@@ -38,13 +45,19 @@ class DopamineEngine:
         self._extractor = SignalExtractor()
         self._rpe_calc = RPECalculator(self._config.loss_aversion)
         self._injector = ContextInjector(self._config.injection)
+        self._dual_mode = DualModeReward(
+            tonic_config=self._config.tonic,
+            phasic_config=self._config.phasic,
+        )
+        self._momentum = MomentumTracker(self._config.momentum)
+        self._distributional = DistributionalChannels(self._config.distributional)
+        self._dist_coding = DistributionalCoding(self._distributional)
+        self._timescale = TimescaleTracker(self._config.timescale)
+        self._safety = SafetyMonitor(self._config.safety)
 
         # State
-        self._tonic_baseline: float = self._config.tonic.initial_baseline
         self._step_count: int = 0
         self._outcome_history: deque[float] = deque(maxlen=100)
-        self._streak_count: int = 0
-        self._streak_sign: int = 0  # 1 = wins, -1 = losses, 0 = none
         self._last_rpe: float = 0.0
         self._last_signals: ExtractedSignals | None = None
         self._last_composite: CompositeSignal | None = None
@@ -61,6 +74,9 @@ class DopamineEngine:
         Returns:
             Augmented prompt with injected motivation context.
         """
+        if self._safety.is_circuit_broken:
+            return base_prompt
+
         signal = self._build_current_signal()
         context = self._injector.build_context(signal)
         return self._injector.inject(base_prompt, context)
@@ -95,31 +111,43 @@ class DopamineEngine:
         rpe = self._rpe_calc.compute(
             outcome=normalized_outcome,
             confidence=confidence,
-            baseline=self._tonic_baseline,
+            baseline=self._dual_mode.tonic.level,
         )
         self._last_rpe = rpe.error
 
-        # 4. Update tonic baseline (slow EMA) — driven by RPE, not raw outcome
-        self._update_tonic(rpe.raw_error)
+        # 4. Process through dual-mode reward system (tonic + phasic)
+        composite_value = self._dual_mode.process(rpe)
 
-        # 5. Update streak tracking
-        self._update_streak(outcome.pnl)
+        # 5. Update distributional channels
+        self._distributional.update(normalized_outcome)
 
-        # 6. Record outcome
+        # 6. Update timescale tracker
+        self._timescale.update(composite_value, TimescaleLevel.STEP)
+
+        # 7. Update momentum tracking
+        self._momentum.update(outcome.pnl)
+
+        # 8. Record outcome
         self._outcome_history.append(outcome.pnl)
         self._step_count += 1
 
-        # 7. Apply safety clamping
-        clamped_rpe = self._clamp(rpe.error)
+        # 9. Safety: clamp and apply attenuation
+        clamped_value = self._safety.clamp_signal(composite_value)
+        attenuation = self._safety.get_attenuation_factor()
+        clamped_value *= attenuation
 
-        # 8. Build composite signal
+        # 10. Safety: check for violations
+        self._safety.check_and_record(clamped_value, confidence)
+
+        # 11. Build composite signal with distributional risk assessment
+        risk_score = self._dist_coding.get_risk_score()
         composite = CompositeSignal(
-            value=clamped_rpe,
+            value=clamped_value,
             confidence_factor=confidence,
-            risk_assessment=signals.risk_framing,
-            momentum_factor=self._compute_momentum_factor(),
-            tonic_level=self._tonic_baseline,
-            phasic_response=rpe.error,
+            risk_assessment=risk_score,
+            momentum_factor=self._momentum.get_momentum_factor(),
+            tonic_level=self._dual_mode.tonic.level,
+            phasic_response=self._dual_mode.phasic.current_response,
         )
         self._last_composite = composite
         return composite
@@ -127,30 +155,37 @@ class DopamineEngine:
     def get_state(self) -> EngineState:
         """Snapshot full state for serialization/persistence."""
         return EngineState(
-            tonic_baseline=self._tonic_baseline,
+            tonic_baseline=self._dual_mode.tonic.level,
             step_count=self._step_count,
             outcome_history=list(self._outcome_history),
-            streak_count=self._streak_count,
-            streak_sign=self._streak_sign,
+            streak_count=self._momentum.streak_count,
+            streak_sign=self._momentum.streak_sign,
+            phasic_signals=self._dual_mode.phasic.get_history(),
+            channel_expectations=self._distributional.expectations,
             last_rpe=self._last_rpe,
         )
 
     def load_state(self, state: EngineState) -> None:
         """Restore engine from a saved state snapshot."""
-        self._tonic_baseline = state.tonic_baseline
+        self._dual_mode.tonic.load(state.tonic_baseline, state.step_count)
         self._step_count = state.step_count
         self._outcome_history = deque(state.outcome_history, maxlen=100)
-        self._streak_count = state.streak_count
-        self._streak_sign = state.streak_sign
+        self._momentum.load(state.streak_count, state.streak_sign)
+        if state.phasic_signals:
+            self._dual_mode.phasic.load_history(state.phasic_signals)
+        if state.channel_expectations:
+            self._distributional.load_expectations(state.channel_expectations)
         self._last_rpe = state.last_rpe
 
     def reset(self) -> None:
         """Reset all state to initial values."""
-        self._tonic_baseline = self._config.tonic.initial_baseline
+        self._dual_mode.reset()
+        self._momentum.reset()
+        self._distributional.reset()
+        self._timescale.reset()
+        self._safety.reset()
         self._step_count = 0
         self._outcome_history.clear()
-        self._streak_count = 0
-        self._streak_sign = 0
         self._last_rpe = 0.0
         self._last_signals = None
         self._last_composite = None
@@ -161,11 +196,23 @@ class DopamineEngine:
 
     @property
     def tonic_baseline(self) -> float:
-        return self._tonic_baseline
+        return self._dual_mode.tonic.level
 
     @property
     def last_composite(self) -> CompositeSignal | None:
         return self._last_composite
+
+    @property
+    def safety(self) -> SafetyMonitor:
+        return self._safety
+
+    @property
+    def timescale(self) -> TimescaleTracker:
+        return self._timescale
+
+    @property
+    def distributional(self) -> DistributionalChannels:
+        return self._distributional
 
     # --- Private methods ---
 
@@ -178,54 +225,17 @@ class DopamineEngine:
             confidence_factor=0.0,
             risk_assessment=0.0,
             momentum_factor=0.0,
-            tonic_level=self._tonic_baseline,
+            tonic_level=self._dual_mode.tonic.level,
             phasic_response=0.0,
         )
 
     def _normalize_pnl(self, pnl: float) -> float:
-        """Normalize raw PnL to [0, 1] using a sigmoid-like mapping."""
-        # Simple tanh-based normalization, then shift to [0, 1]
-        import math
+        """Normalize raw PnL to [0, 1] using a sigmoid-like mapping.
 
-        normalized = math.tanh(pnl / 100.0)  # scale factor for typical PnL values
+        Uses the configured pnl_scale to handle different PnL magnitudes:
+        - For USDC bets (pnl ±1): pnl_scale=1.0 (default)
+        - For dollar amounts (pnl ±100): pnl_scale=100.0
+        """
+        scale = self._dual_mode.pnl_scale
+        normalized = math.tanh(pnl / scale)
         return (normalized + 1.0) / 2.0  # shift from [-1,1] to [0,1]
-
-    def _update_tonic(self, normalized_outcome: float) -> None:
-        """Update tonic baseline with exponential moving average."""
-        cfg = self._config.tonic
-        self._tonic_baseline = (
-            self._tonic_baseline * cfg.decay_rate
-            + cfg.learning_rate * (normalized_outcome - self._tonic_baseline)
-        )
-        # Clamp to bounds
-        max_level = cfg.max_level
-        self._tonic_baseline = max(-max_level, min(max_level, self._tonic_baseline))
-
-    def _update_streak(self, pnl: float) -> None:
-        """Update win/loss streak tracking."""
-        current_sign = 1 if pnl > 0 else (-1 if pnl < 0 else 0)
-
-        if current_sign == 0:
-            return  # neutral outcome doesn't break or extend streak
-
-        if current_sign == self._streak_sign:
-            self._streak_count += 1
-        else:
-            self._streak_sign = current_sign
-            self._streak_count = 1
-
-    def _compute_momentum_factor(self) -> float:
-        """Compute momentum multiplier from streak state."""
-        cfg = self._config.momentum
-        if self._streak_count < cfg.streak_threshold:
-            return 0.0
-
-        # Scale linearly from threshold to max
-        excess = self._streak_count - cfg.streak_threshold
-        factor = min(1.0 + excess * 0.1, cfg.max_streak_multiplier)
-        return factor * self._streak_sign
-
-    def _clamp(self, value: float) -> float:
-        """Clamp signal to safe bounds."""
-        mag = self._config.safety.max_signal_magnitude
-        return max(-mag, min(mag, value))
