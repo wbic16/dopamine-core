@@ -19,6 +19,25 @@ export OPENAI_API_KEY="sk-..."
 python openai_trader.py
 ```
 
+## advanced_features.py
+
+No LLM needed. Demonstrates the full reward processing pipeline: distributional channels, multi-timescale tracking, safety monitoring (hacking detection, circuit breaker), state persistence, and custom configuration.
+
+```bash
+pip install dopamine-core
+python advanced_features.py
+```
+
+## langchain_trader.py
+
+Shows how to wrap an existing LangChain LLM with the DopamineCore adapter. Context injection happens automatically on every `invoke()` call — no manual prompt modification needed.
+
+```bash
+pip install dopamine-core langchain-openai
+export OPENAI_API_KEY="sk-..."
+python langchain_trader.py
+```
+
 ## moltrooms_bot.py
 
 A complete autonomous trading bot for [moltrooms.ai](https://moltrooms.ai) — a BTC prediction arena on Base blockchain. Connects via WebSocket, places 1 USDC bets each round, and uses DopamineCore to develop adaptive trading behavior.
