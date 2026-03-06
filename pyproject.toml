@@ -23,10 +23,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/DopamineCoreAI/dopamine-core"
-Repository = "https://github.com/DopamineCoreAI/dopamine-core"
-Issues = "https://github.com/DopamineCoreAI/dopamine-core/issues"
-Documentation = "https://github.com/DopamineCoreAI/dopamine-core#readme"
+Homepage = "https://github.com/anbarchik/dopamine-core"
+Repository = "https://github.com/anbarchik/dopamine-core"
+Issues = "https://github.com/anbarchik/dopamine-core/issues"
+Documentation = "https://github.com/anbarchik/dopamine-core#readme"
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.26"]
